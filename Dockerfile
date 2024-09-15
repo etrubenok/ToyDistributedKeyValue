@@ -80,7 +80,7 @@ RUN ldconfig && ldconfig -p | grep rocksdb
 COPY --from=builder /app/toyapp .
 
 # Expose any ports (if necessary)
-# EXPOSE 8080
+EXPOSE 3000
 
 # Command to run the application
 CMD ["./toyapp"]
