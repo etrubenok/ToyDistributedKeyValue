@@ -1,34 +1,29 @@
 package handlers
 
 import (
+	"ToyDistributedKeyValue/config"
+	"ToyDistributedKeyValue/kvstore"
+	toyraft "ToyDistributedKeyValue/raft"
+	"fmt"
 	"github.com/gofiber/fiber/v2"
-	"github.com/linxGnu/grocksdb"
+	"github.com/hashicorp/raft"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
+	"strings"
 )
 
-var db *grocksdb.DB
+var raftNode *toyraft.RaftNode
 
-// InitDB Initialize the RocksDB database
-func InitDB() {
-	bbto := grocksdb.NewDefaultBlockBasedTableOptions()
-	bbto.SetBlockCache(grocksdb.NewLRUCache(3 << 30))
-
-	// Options for RocksDB
-	opts := grocksdb.NewDefaultOptions()
-	opts.SetBlockBasedTableFactory(bbto)
-	opts.SetCreateIfMissing(true)
-
-	// Open RocksDB database (this creates or opens the DB in "./testdb" directory)
+func InitRaftNode(nodeID, addr string, fsm *kvstore.FSM, peers []string, bootstrapCluster bool) error {
+	// Initialize the Raft node
 	var err error
-	db, err = grocksdb.OpenDb(opts, "./testdb")
+	raftNode, err = toyraft.NewRaftNode(nodeID, addr, fsm, peers, bootstrapCluster)
 	if err != nil {
-		log.Fatalf("Failed to open RocksDB: %v", err)
+		return fmt.Errorf("failed to initialize Raft: %v", err)
 	}
-}
-
-// CloseDB Close the RocksDB database
-func CloseDB() {
-	db.Close()
+	return nil
 }
 
 // SetKeyValue handles POST /key requests to set a key-value pair
@@ -44,17 +39,29 @@ func SetKeyValue(c *fiber.Ctx) error {
 		})
 	}
 
-	// Store the key-value pair in RocksDB
-	wo := grocksdb.NewDefaultWriteOptions()
-	defer wo.Destroy()
+	// Check whether the Raft node is a leader
+	if raftNode.Raft.State() != raft.Leader {
+		// If it is not a leader, redirect the request to the leader
+		// If this node is not the leader, forward the request to the leader
+		leaderAddr, _ := raftNode.Raft.LeaderWithID() // Returns Raft address of the leader
+		if leaderAddr == "" {
+			log.Println("No Raft leader available")
+			return c.Status(http.StatusServiceUnavailable).SendString("No leader available")
+		}
 
-	err := db.Put(wo, []byte(key), []byte(value))
-	if err != nil {
-		log.Printf("Failed to set key-value pair: %v", err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to set key-value pair",
-		})
+		// Forward the request to the leader
+		resp, err := forwardToLeader(string(leaderAddr), key, value)
+		if err != nil {
+			return c.Status(http.StatusInternalServerError).SendString("Failed to forward request to leader")
+		}
+		return c.Send(resp)
+	} else {
+		// It is the leader, so propose the new key:value to Raft
+		if err := raftNode.ProposeSet(key, value); err != nil {
+			return c.Status(http.StatusInternalServerError).SendString(fmt.Sprintf("Failed to set value: %v", err))
+		}
 	}
+
 	// Return success message
 	return c.JSON(fiber.Map{
 		"message": "Key-value pair set successfully",
@@ -66,48 +73,54 @@ func GetKeyValue(c *fiber.Ctx) error {
 	// Extract the key from the URL parameter
 	key := c.Params("key")
 
-	// Create ReadOptions
-	ro := grocksdb.NewDefaultReadOptions()
-	defer ro.Destroy()
-
-	// Get the value from RocksDB
-	value, err := db.Get(ro, []byte(key))
+	value, err := raftNode.Store.Get(key)
 	if err != nil {
-		log.Printf("Failed to get value for key %s: %v", key, err)
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to get value",
-		})
+		return c.Status(http.StatusInternalServerError).SendString(fmt.Sprintf("Failed to get value: %v", err))
 	}
-
-	if !value.Exists() {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Key not found",
-		})
+	if value == "" {
+		return c.Status(http.StatusNotFound).SendString("Key not found")
 	}
 
 	// Return the key-value pair
 	return c.JSON(fiber.Map{
 		"key":   key,
-		"value": string(value.Data()),
+		"value": value,
 	})
 }
 
 func HealthCheck(ctx *fiber.Ctx) error {
-	// Check that the database is open
-	if db == nil {
+	// Check that the raftNode is not nil
+	if raftNode == nil {
 		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database is not open",
+			"error": "Raft node is not initialized",
 		})
 	}
-	// Check that the database is alive
-	status := db.GetProperty("rocksdb.stats")
-	if status == "" {
-		return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database is not alive",
-		})
-	}
+
 	// Return success message
 	return ctx.JSON(fiber.Map{
 		"message": "Database is alive",
 	})
+}
+
+// forwardToLeader forwards a POST request to the leader
+func forwardToLeader(leaderAddr, key, value string) ([]byte, error) {
+	// Make a POST request to the leader with the key and value as URL-encoded parameters
+
+	// Take the host name from the leaderAddr only
+	// The leaderAddr is in the format of "<host>:<port>"
+	leaderHostname := strings.Split(leaderAddr, ":")[0]
+	resp, err := http.Post(fmt.Sprintf("http://%s:%d/key?key=%s&value=%s", leaderHostname, config.HttpApiPort,
+		url.QueryEscape(key),
+		url.QueryEscape(value)), "application/x-www-form-urlencoded", nil)
+	if err != nil {
+		log.Printf("Failed to forward request to leader: %v", err)
+		return nil, err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Failed to read response body: %v", err)
+		return nil, err
+	}
+	return body, nil
 }
